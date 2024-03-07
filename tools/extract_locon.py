@@ -117,6 +117,12 @@ def get_args():
         default=False,
         action="store_true",
     )
+    parser.add_argument(
+        "--dtype",
+        help="dtype loading the checkpoints",
+        default="bfloat16",
+        type=str,
+    )
     return parser.parse_args()
 
 
@@ -133,9 +139,18 @@ from safetensors.torch import save_file
 
 def main():
     args = ARGS
+
+    dtype = None
+    if args.dtype == "bfloat16":
+        dtype = torch.bfloat16
+    elif args.dtype == "float32":
+        dtype = torch.float32
+    elif args.dtype == "float16":
+        dtype = torch.float16
+    
     if args.is_sdxl:
-        base = load_models_from_sdxl_checkpoint(None, args.base_model, "cpu")
-        db = load_models_from_sdxl_checkpoint(None, args.db_model, "cpu")
+        base = load_models_from_sdxl_checkpoint(None, args.base_model, "cpu", dtype=dtype)
+        db = load_models_from_sdxl_checkpoint(None, args.db_model, "cpu", dtype=dtype)
     else:
         base = load_models_from_stable_diffusion_checkpoint(args.is_v2, args.base_model)
         db = load_models_from_stable_diffusion_checkpoint(args.is_v2, args.db_model)

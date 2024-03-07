@@ -1,3 +1,5 @@
+import gc
+
 import torch
 from safetensors.torch import load_file, save_file
 from transformers import (
@@ -146,7 +148,7 @@ def convert_sdxl_text_encoder_2_checkpoint(checkpoint, max_length):
     return new_sd, logit_scale
 
 
-def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location):
+def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dtype=None):
     # model_version is reserved for future use
 
     # Load the state dict
@@ -175,10 +177,16 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location):
     unet_sd = {}
     for k in list(state_dict.keys()):
         if k.startswith("model.diffusion_model."):
-            unet_sd[k.replace("model.diffusion_model.", "")] = state_dict.pop(k)
+            if dtype is not None:
+                tensor = state_dict.pop(k).to(dtype)
+            else:
+                tensor = state_dict.pop(k)
+
+            unet_sd[k.replace("model.diffusion_model.", "")] = tensor
     info = unet.load_state_dict(unet_sd)
     print("U-Net: ", info)
     del unet_sd
+    gc.collect()
 
     # Text Encoders
     print("building text encoders")

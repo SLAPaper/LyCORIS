@@ -1,4 +1,5 @@
 from typing import *
+import gc
 import re
 
 import numpy as np
@@ -300,6 +301,7 @@ def extract_diff(
         UNET_TARGET_REPLACE_MODULE,
     )
     del base_unet, db_unet
+    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
