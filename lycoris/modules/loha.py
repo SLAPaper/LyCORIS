@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .base import ModuleCustomSD
+from ..utils.bnb import LinearNF4, QuantLinears, log_bypass
 
 
 class HadaWeight(torch.autograd.Function):
@@ -100,6 +101,7 @@ class LohaModule(ModuleCustomSD):
         use_scalar=False,
         rank_dropout_scale=False,
         weight_decompose=False,
+        bypass_mode=False,
         **kwargs,
     ):
         """if alpha == 0 or None, alpha is rank (no scaling)."""
@@ -113,6 +115,7 @@ class LohaModule(ModuleCustomSD):
             in_dim = org_module.in_channels
             k_size = org_module.kernel_size
             out_dim = org_module.out_channels
+            self.shape = (out_dim, in_dim, *k_size)
             self.tucker = use_tucker and k_size != (1, 1)
             if self.tucker:
                 shape = (out_dim, in_dim, *k_size)
@@ -129,8 +132,18 @@ class LohaModule(ModuleCustomSD):
             in_dim = org_module.in_features
             out_dim = org_module.out_features
             shape = (out_dim, in_dim)
+            self.shape = shape
             self.op = F.linear
             self.extra_args = {}
+
+        if isinstance(org_module, QuantLinears):
+            if not bypass_mode:
+                log_bypass()
+            bypass_mode = True
+        self.bypass_mode = bypass_mode
+        assert not (
+            bypass_mode and weight_decompose
+        ), "bypass_mode and dora_wd cannot be used together"
 
         if self.tucker:
             self.hada_t1 = nn.Parameter(
@@ -162,10 +175,16 @@ class LohaModule(ModuleCustomSD):
         self.wd = weight_decompose
         if self.wd:
             org_weight: nn.Parameter = org_module.weight
-            self.dora_mean_dim = tuple(i for i in range(org_weight.dim()) if i != 1)
+            self.dora_norm_dims = org_weight.dim() - 1
             self.dora_scale = nn.Parameter(
-                torch.mean(org_weight, dim=self.dora_mean_dim, keepdim=True)
-            )
+                torch.norm(
+                    org_weight.transpose(1, 0).reshape(org_weight.shape[1], -1),
+                    dim=1,
+                    keepdim=True,
+                )
+                .reshape(org_weight.shape[1], *[1] * self.dora_norm_dims)
+                .transpose(1, 0)
+            ).float()
 
         self.dropout = dropout
         if dropout:
@@ -215,10 +234,10 @@ class LohaModule(ModuleCustomSD):
         self.org_module[0].forward = self.org_forward
 
     def merge_to(self, multiplier=1.0):
-        weight = self.get_weight(self.org_module[0].weight)
+        weight = self.get_weight(self.shape)
         self.org_module[0].weight.data.add_(weight * multiplier)
 
-    def get_weight(self, orig_weight=None):
+    def get_weight(self, shape):
         if self.tucker:
             weight = make_weight_tucker(
                 self.hada_t1,
@@ -237,8 +256,8 @@ class LohaModule(ModuleCustomSD):
                 self.hada_w2_b,
                 scale=torch.tensor(self.scale),
             )
-        if orig_weight is not None:
-            weight = weight.reshape(orig_weight.shape)
+        if shape is not None:
+            weight = weight.reshape(shape)
         if self.training and self.rank_dropout:
             drop = (torch.rand(weight.size(0)) > self.rank_dropout).to(weight.dtype)
             drop = drop.view(-1, *[1] * len(weight.shape[1:])).to(weight.device)
@@ -248,9 +267,15 @@ class LohaModule(ModuleCustomSD):
         return weight
 
     def apply_weight_decompose(self, weight):
-        return (
-            weight / weight.mean(dim=self.dora_mean_dim, keepdim=True) * self.dora_scale
+        weight_norm = (
+            weight.transpose(0, 1)
+            .reshape(weight.shape[1], -1)
+            .norm(dim=1, keepdim=True)
+            .reshape(weight.shape[1], *[1] * self.dora_norm_dims)
+            .transpose(0, 1)
         )
+
+        return weight * (self.dora_scale / weight_norm)
 
     def custom_state_dict(self):
         destination = {}
@@ -268,12 +293,12 @@ class LohaModule(ModuleCustomSD):
 
     @torch.no_grad()
     def apply_max_norm(self, max_norm, device=None):
-        orig_norm = (self.get_weight() * self.scalar).norm()
+        orig_norm = (self.get_weight(self.shape) * self.scalar).norm()
         norm = torch.clamp(orig_norm, max_norm / 2)
         desired = torch.clamp(norm, max=max_norm)
         ratio = desired.cpu() / norm.cpu()
 
-        scaled = ratio.item() != 1.0
+        scaled = norm != desired
         if scaled:
             self.scalar *= ratio
 
@@ -292,14 +317,47 @@ class LohaModule(ModuleCustomSD):
                         else self.org_module[0].bias.data
                     ),
                 )
-        weight = (
-            self.org_module[0].weight.data.to(x.device, dtype=self.hada_w1_a.dtype)
-            + self.get_weight(self.org_module[0].weight.data)
-            * self.scalar
-            * self.multiplier
-        )
-        bias = None if self.org_module[0].bias is None else self.org_module[0].bias.data
+        if self.bypass_mode:
+            diff_weight = self.get_weight(self.shape) * self.scalar * self.multiplier
+            return self.org_forward(x) + self.op(
+                x, diff_weight.view(self.shape), **self.extra_args
+            )
+        else:
+            weight = (
+                self.org_module[0].weight.data.to(x.device, dtype=self.hada_w1_a.dtype)
+                + self.get_weight(self.shape) * self.scalar * self.multiplier
+            )
+            bias = (
+                None
+                if self.org_module[0].bias is None
+                else self.org_module[0].bias.data
+            )
 
-        if self.wd:
-            weight = self.apply_weight_decompose(weight)
-        return self.op(x, weight.view(self.shape), bias, **self.extra_args)
+            if self.wd:
+                weight = self.apply_weight_decompose(weight)
+            return self.op(x, weight.view(self.shape), bias, **self.extra_args)
+
+
+if __name__ == "__main__":
+    base = nn.Linear(128, 128).cuda()
+    lokr = LohaModule("test", base, 1, 4, 1, weight_decompose=True).cuda()
+    print(lokr)
+    test_input = torch.randn(1, 128).cuda()
+    test_output = lokr(test_input)
+    print(test_output.shape)
+
+    base_4bit = LinearNF4(128, 128)
+    base_4bit.load_state_dict(base.state_dict())
+    base_4bit.cuda()
+    qlocon = LohaModule("test", base_4bit, 1, 4, 1, weight_decompose=False).cuda()
+    print(qlocon)
+    test_input = torch.randn(1, 128).cuda()
+    test_output = qlocon(test_input)
+    print(test_output.shape)
+
+    base = nn.Conv2d(128, 128, 3, 1, 1)
+    lokr = LohaModule("test", base, 1, 4, 1, weight_decompose=True, use_tucker=True)
+    print(lokr)
+    test_input = torch.randn(1, 128, 16, 16)
+    test_output = lokr(test_input)
+    print(test_output.shape)

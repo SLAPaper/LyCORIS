@@ -9,8 +9,8 @@ sys.setrecursionlimit(10000)
 from typing import List
 
 import torch
+import torch.nn as nn
 
-from .utils import *
 from .modules.locon import LoConModule
 from .modules.loha import LohaModule
 from .modules.lokr import LokrModule
@@ -68,6 +68,13 @@ def create_lycoris(module, multiplier, linear_dim, linear_alpha, **kwargs):
     rescaled = str_bool(kwargs.get("rescaled", False))
     weight_decompose = str_bool(kwargs.get("dora_wd", False))
     full_matrix = str_bool(kwargs.get("full_matrix", False))
+    bypass_mode = str_bool(kwargs.get("bypass_mode", False))
+
+    if bypass_mode:
+        logger.info("Bypass mode is enabled")
+
+    if weight_decompose:
+        logger.info("Weight decomposition is enabled")
 
     if full_matrix:
         logger.info("Full matrix mode for LoKr is enabled")
@@ -121,6 +128,7 @@ def create_lycoris(module, multiplier, linear_dim, linear_alpha, **kwargs):
         rescaled=rescaled,
         weight_decompose=weight_decompose,
         full_matrix=full_matrix,
+        bypass_mode=bypass_mode,
     )
 
     if algo == "dylora":
@@ -280,10 +288,10 @@ class LycorisNetwork(torch.nn.Module):
                     **kwargs,
                 )
             lora = None
-            if module.__class__.__name__ == "Linear" and lora_dim > 0:
+            if isinstance(module, torch.nn.Linear) and lora_dim > 0:
                 dim = dim or lora_dim
                 alpha = alpha or self.alpha
-            elif module.__class__.__name__ == "Conv2d":
+            elif isinstance(module, torch.nn.Conv2d):
                 k_size, *_ = module.kernel_size
                 if k_size == 1 and lora_dim > 0:
                     dim = dim or lora_dim

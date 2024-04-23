@@ -5,8 +5,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from einops import rearrange
+
 from .base import ModuleCustomSD
 from ..logging import logger
+from ..utils.bnb import LinearNF4, QuantLinears, log_bypass
 
 
 @cache
@@ -101,6 +104,7 @@ class LokrModule(ModuleCustomSD):
         rank_dropout_scale=False,
         weight_decompose=False,
         full_matrix=False,
+        bypass_mode=False,
         **kwargs,
     ):
         """if alpha == 0 or None, alpha is rank (no scaling)."""
@@ -111,13 +115,14 @@ class LokrModule(ModuleCustomSD):
         self.tucker = False
         self.use_w1 = False
         self.use_w2 = False
-        self.full_matrix = False
+        self.full_matrix = full_matrix
 
         self.shape = org_module.weight.shape
         if org_module.__class__.__name__ == "Conv2d":
             in_dim = org_module.in_channels
             k_size = org_module.kernel_size
             out_dim = org_module.out_channels
+            self.shape = (out_dim, in_dim, *k_size)
 
             in_m, in_n = factorization(in_dim, factor)
             out_l, out_k = factorization(out_dim, factor)
@@ -172,6 +177,7 @@ class LokrModule(ModuleCustomSD):
         else:  # Linear
             in_dim = org_module.in_features
             out_dim = org_module.out_features
+            self.shape = (out_dim, in_dim)
 
             in_m, in_n = factorization(in_dim, factor)
             out_l, out_k = factorization(out_dim, factor)
@@ -200,13 +206,28 @@ class LokrModule(ModuleCustomSD):
             self.op = F.linear
             self.extra_args = {}
 
+        if isinstance(org_module, QuantLinears):
+            if not bypass_mode:
+                log_bypass()
+            bypass_mode = True
+        self.bypass_mode = bypass_mode
+        assert not (
+            bypass_mode and weight_decompose
+        ), "bypass_mode and dora_wd cannot be used together"
+
         self.wd = weight_decompose
         if self.wd:
             org_weight: nn.Parameter = org_module.weight
-            self.dora_mean_dim = tuple(i for i in range(org_weight.dim()) if i != 1)
+            self.dora_norm_dims = org_weight.dim() - 1
             self.dora_scale = nn.Parameter(
-                torch.mean(org_weight, dim=self.dora_mean_dim, keepdim=True)
-            )
+                torch.norm(
+                    org_weight.transpose(1, 0).reshape(org_weight.shape[1], -1),
+                    dim=1,
+                    keepdim=True,
+                )
+                .reshape(org_weight.shape[1], *[1] * self.dora_norm_dims)
+                .transpose(1, 0)
+            ).float()
 
         self.dropout = dropout
         if dropout:
@@ -283,10 +304,10 @@ class LokrModule(ModuleCustomSD):
         self.org_module[0].forward = self.org_forward
 
     def merge_to(self, multiplier=1.0):
-        weight = self.get_weight(self.org_module[0].weight)
+        weight = self.get_weight(self.shape)
         self.org_module[0].weight.data.add_(weight * multiplier)
 
-    def get_weight(self, orig_weight=None):
+    def get_weight(self, shape):
         weight = make_kron(
             self.lokr_w1 if self.use_w1 else self.lokr_w1_a @ self.lokr_w1_b,
             (
@@ -300,8 +321,8 @@ class LokrModule(ModuleCustomSD):
             ),
             torch.tensor(self.scale),
         )
-        if orig_weight is not None:
-            weight = weight.reshape(orig_weight.shape)
+        if shape is not None:
+            weight = weight.reshape(shape)
         if self.training and self.rank_dropout:
             drop = (torch.rand(weight.size(0)) > self.rank_dropout).to(weight.dtype)
             drop = drop.view(-1, *[1] * len(weight.shape[1:])).to(weight.device)
@@ -311,9 +332,15 @@ class LokrModule(ModuleCustomSD):
         return weight
 
     def apply_weight_decompose(self, weight):
-        return (
-            weight / weight.mean(dim=self.dora_mean_dim, keepdim=True) * self.dora_scale
+        weight_norm = (
+            weight.transpose(0, 1)
+            .reshape(weight.shape[1], -1)
+            .norm(dim=1, keepdim=True)
+            .reshape(weight.shape[1], *[1] * self.dora_norm_dims)
+            .transpose(0, 1)
         )
+
+        return weight * (self.dora_scale / weight_norm)
 
     def custom_state_dict(self):
         destination = {}
@@ -337,12 +364,12 @@ class LokrModule(ModuleCustomSD):
 
     @torch.no_grad()
     def apply_max_norm(self, max_norm, device=None):
-        orig_norm = self.get_weight().norm()
+        orig_norm = self.get_weight(self.shape).norm()
         norm = torch.clamp(orig_norm, max_norm / 2)
         desired = torch.clamp(norm, max=max_norm)
         ratio = desired.cpu() / norm.cpu()
 
-        scaled = ratio.item() != 1.0
+        scaled = norm != desired
         if scaled:
             modules = 4 - self.use_w1 - self.use_w2 + (not self.use_w2 and self.tucker)
             if self.use_w1:
@@ -361,6 +388,39 @@ class LokrModule(ModuleCustomSD):
 
         return scaled, orig_norm * ratio
 
+    def bypass_forward(self, h):
+        if isinstance(self.org_module[0], nn.Conv2d):
+            h = h.transpose(1, -1)
+        if self.use_w2:
+            ba = self.lokr_w2
+        else:
+            a = self.lokr_w2_b
+            b = self.lokr_w2_a
+        if self.use_w1:
+            c = self.lokr_w1
+        else:
+            c = self.lokr_w1_a @ self.lokr_w1_b
+        uq = c.size(1)
+
+        if self.use_w2:
+            vq = ba.size(1)
+            h_in_group = rearrange(h, "b ... (uq vq) -> b ... uq vq", uq=uq, vq=vq)
+            hb = F.linear(h_in_group, ba)
+        else:
+            vq = a.size(1)
+            h_in_group = rearrange(h, "b ... (uq vq) -> b ... uq vq", uq=uq, vq=vq)
+            ha = F.linear(h_in_group, a)
+            hb = F.linear(ha, b)
+
+        h_cross_group = hb.transpose(-1, -2)
+        hc = F.linear(h_cross_group, c)
+
+        h = rearrange(hc, "b ... vp up -> b ... (up vp)")
+        if isinstance(self.org_module[0], nn.Conv2d):
+            h = h.transpose(1, -1)
+
+        return h
+
     def forward(self, x):
         if self.module_dropout and self.training:
             if torch.rand(1) < self.module_dropout:
@@ -373,23 +433,62 @@ class LokrModule(ModuleCustomSD):
                         else self.org_module[0].bias.data
                     ),
                 )
-        weight = (
-            self.org_module[0].weight.data.to(x.device, dtype=self.lokr_w1.dtype)
-            + self.get_weight(self.org_module[0].weight.data)
-            * self.scalar
-            * self.multiplier
-        )
-        bias = None if self.org_module[0].bias is None else self.org_module[0].bias.data
+        if self.bypass_mode:
+            if len(self.shape) > 2 and self.shape[2] > 1:
+                return self.org_forward(x) + self.op(
+                    x, self.get_weight(self.shape), **self.extra_args
+                )
+            else:
+                return self.org_forward(x) + self.bypass_forward(x)
+        else:
+            weight = (
+                self.org_module[0].weight.data.to(
+                    x.device, dtype=next(self.parameters()).dtype
+                )
+                + self.get_weight(self.shape) * self.scalar * self.multiplier
+            )
+            bias = (
+                None
+                if self.org_module[0].bias is None
+                else self.org_module[0].bias.data
+            )
 
-        if self.wd:
-            weight = self.apply_weight_decompose(weight)
-        return self.op(x, weight.view(self.shape), bias, **self.extra_args)
+            if self.wd:
+                weight = self.apply_weight_decompose(weight)
+            return self.op(x, weight.view(self.shape), bias, **self.extra_args)
 
 
 if __name__ == "__main__":
-    base = nn.Linear(128, 128)
-    lokr = LokrModule("test", base, 1, 4, 1, weight_decompose=True)
+    base = nn.Linear(128, 128).cuda()
+    lokr = LokrModule("test", base, 1, 4, 1, weight_decompose=True, factor=8).cuda()
     print(lokr)
-    test_input = torch.randn(1, 128)
+    test_input = torch.randn(1, 77, 128).cuda()
+    test_output = lokr(test_input)
+    print(test_output.shape)
+
+    # opt = torch.optim.AdamW(lokr.parameters(), lr=1e-2)
+    # for _ in range(100):
+    #     x = torch.randn(128, 128).cuda()
+    #     t = x / 10
+    #     y = lokr(x)
+    #     loss = F.mse_loss(y, t)
+    #     loss.backward()
+    #     opt.step()
+    #     opt.zero_grad()
+    #     print(loss.item())
+
+    base_4bit = LinearNF4(128, 128)
+    base_4bit.load_state_dict(base.state_dict())
+    base_4bit.cuda()
+    qlocon = LokrModule("test", base_4bit, 1, 4, 1, weight_decompose=False).cuda()
+    print(qlocon)
+    test_output2 = qlocon(test_input)
+    print(test_output2.shape)
+    print(F.mse_loss(test_output, test_output2))
+
+    base = nn.Conv2d(128, 128, 3, 1, 1)
+    lokr = LokrModule("test", base, 1, 4, 1, weight_decompose=True, use_tucker=True)
+    print(lokr)
+    test_input = torch.randn(1, 128, 16, 16)
     test_output = lokr(test_input)
     print(test_output.shape)

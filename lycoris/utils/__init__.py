@@ -1,6 +1,6 @@
-from typing import *
 import gc
 import re
+from typing import Dict, Tuple, Union
 
 import numpy as np
 
