@@ -120,7 +120,7 @@ def get_args():
     parser.add_argument(
         "--dtype",
         help="dtype loading the checkpoints",
-        default="bfloat16",
+        default="float16",
         type=str,
     )
     return parser.parse_args()
