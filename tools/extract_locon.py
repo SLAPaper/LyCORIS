@@ -123,6 +123,8 @@ def get_args():
         default="float16",
         type=str,
     )
+    parser.add_argument("--exclude-clip1", action="store_true", default=False, help="exclude clip 1, useful when svd not converge")
+    parser.add_argument("--exclude-clip2", action="store_true", default=False, help="exclude clip 2 (only for SDXL models), useful when svd not converge")
     return parser.parse_args()
 
 
@@ -175,10 +177,21 @@ def main():
         db_unet = db[3]
         base_tes = [base[0], base[1]]
         base_unet = base[3]
+
+        if args.exclude_clip1 and args.exclude_clip2:
+            db_tes = []
+            base_tes = []
+        elif args.exclude_clip1:
+            del db_tes[0]
+            del base_tes[0]
+        elif args.exclude_clip2:
+            del db_tes[-1]
+            del base_tes[-1]
+
     else:
-        db_tes = [db[0]]
+        db_tes = [] if args.exclude_clip1 else [db[0]]
         db_unet = db[2]
-        base_tes = [base[0]]
+        base_tes = [] if args.exclude_clip1 else [base[0]]
         base_unet = base[2]
 
     state_dict = extract_diff(
