@@ -294,17 +294,6 @@ def extract_diff(
 
     all_loras = {}
 
-    all_loras |= make_state_dict(
-        LORA_PREFIX_UNET,
-        base_unet,
-        db_unet,
-        UNET_TARGET_REPLACE_MODULE,
-    )
-    del base_unet, db_unet
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
     for idx, (te1, te2) in enumerate(zip(base_tes, db_tes)):
         if len(base_tes) > 1:
             prefix = f"{LORA_PREFIX_TEXT_ENCODER}{idx+1}"
@@ -317,6 +306,17 @@ def extract_diff(
             TEXT_ENCODER_TARGET_REPLACE_MODULE,
         )
         del te1, te2
+
+    all_loras |= make_state_dict(
+        LORA_PREFIX_UNET,
+        base_unet,
+        db_unet,
+        UNET_TARGET_REPLACE_MODULE,
+    )
+    del base_unet, db_unet
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     all_lora_name = set()
     for k in all_loras:
