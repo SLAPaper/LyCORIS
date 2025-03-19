@@ -151,11 +151,11 @@ def main():
         dtype = torch.float16
     
     if args.is_sdxl:
-        base = load_models_from_sdxl_checkpoint(None, args.base_model, args.device, dtype=dtype)
-        db = load_models_from_sdxl_checkpoint(None, args.db_model, args.device, dtype=dtype)
+        base = load_models_from_sdxl_checkpoint(None, args.base_model, "cpu", dtype=dtype)
+        db = load_models_from_sdxl_checkpoint(None, args.db_model, "cpu", dtype=dtype)
     else:
-        base = load_models_from_stable_diffusion_checkpoint(args.is_v2, args.base_model)
-        db = load_models_from_stable_diffusion_checkpoint(args.is_v2, args.db_model)
+        base = load_models_from_stable_diffusion_checkpoint(args.is_v2, "cpu", dtype=dtype)
+        db = load_models_from_stable_diffusion_checkpoint(args.is_v2, "cpu", dtype=dtype)
 
     linear_mode_param = {
         "fixed": args.linear_dim,
