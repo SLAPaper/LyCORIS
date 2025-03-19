@@ -1,5 +1,6 @@
 import gc
 import re
+import sys
 from typing import Dict, Tuple, Union
 
 import numpy as np
@@ -178,116 +179,122 @@ def extract_diff(
             lora_name = prefix + "." + name
             lora_name = lora_name.replace(".", "_")
             layer = module.__class__.__name__
-
-            if layer in {
-                "Linear",
-                "Conv2d",
-                "LayerNorm",
-                "GroupNorm",
-                "GroupNorm32",
-                "Embedding",
-            }:
-                root_weight = module.weight
-                if torch.allclose(root_weight, weights.weight):
+            try:
+                if layer in {
+                    "Linear",
+                    "Conv2d",
+                    "LayerNorm",
+                    "GroupNorm",
+                    "GroupNorm32",
+                    "Embedding",
+                }:
+                    root_weight = module.weight
+                    if torch.allclose(root_weight, weights.weight):
+                        continue
+                else:
                     continue
-            else:
-                continue
-            module = module.to(extract_device)
-            weights = weights.to(extract_device)
+                module = module.to(extract_device)
+                weights = weights.to(extract_device)
 
-            if mode == "full":
-                decompose_mode = "full"
-            elif layer == "Linear":
-                weight, decompose_mode = extract_linear(
-                    (root_weight - weights.weight),
-                    mode,
-                    linear_mode_param,
-                    device=extract_device,
-                )
-                if decompose_mode == "low rank":
-                    extract_a, extract_b, diff = weight
-            elif layer == "Conv2d":
-                is_linear = root_weight.shape[2] == 1 and root_weight.shape[3] == 1
-                weight, decompose_mode = extract_conv(
-                    (root_weight - weights.weight),
-                    mode,
-                    linear_mode_param if is_linear else conv_mode_param,
-                    device=extract_device,
-                )
-                if decompose_mode == "low rank":
-                    extract_a, extract_b, diff = weight
-                if small_conv and not is_linear and decompose_mode == "low rank":
-                    dim = extract_a.size(0)
-                    (extract_c, extract_a, _), _ = extract_conv(
-                        extract_a.transpose(0, 1),
-                        "fixed",
-                        dim,
-                        extract_device,
-                        True,
+                if mode == "full":
+                    decompose_mode = "full"
+                elif layer == "Linear":
+                    weight, decompose_mode = extract_linear(
+                        (root_weight - weights.weight),
+                        mode,
+                        linear_mode_param,
+                        device=extract_device,
                     )
-                    extract_a = extract_a.transpose(0, 1)
-                    extract_c = extract_c.transpose(0, 1)
-                    loras[f"{lora_name}.lora_mid.weight"] = (
-                        extract_c.detach().cpu().contiguous().half()
+                    if decompose_mode == "low rank":
+                        extract_a, extract_b, diff = weight
+                elif layer == "Conv2d":
+                    is_linear = root_weight.shape[2] == 1 and root_weight.shape[3] == 1
+                    weight, decompose_mode = extract_conv(
+                        (root_weight - weights.weight),
+                        mode,
+                        linear_mode_param if is_linear else conv_mode_param,
+                        device=extract_device,
                     )
-                    diff = (
-                        (
-                            root_weight
-                            - torch.einsum(
-                                "i j k l, j r, p i -> p r k l",
-                                extract_c,
-                                extract_a.flatten(1, -1),
-                                extract_b.flatten(1, -1),
-                            )
+                    if decompose_mode == "low rank":
+                        extract_a, extract_b, diff = weight
+                    if small_conv and not is_linear and decompose_mode == "low rank":
+                        dim = extract_a.size(0)
+                        (extract_c, extract_a, _), _ = extract_conv(
+                            extract_a.transpose(0, 1),
+                            "fixed",
+                            dim,
+                            extract_device,
+                            True,
                         )
-                        .detach()
-                        .cpu()
-                        .contiguous()
+                        extract_a = extract_a.transpose(0, 1)
+                        extract_c = extract_c.transpose(0, 1)
+                        loras[f"{lora_name}.lora_mid.weight"] = (
+                            extract_c.detach().cpu().contiguous().half()
+                        )
+                        diff = (
+                            (
+                                root_weight
+                                - torch.einsum(
+                                    "i j k l, j r, p i -> p r k l",
+                                    extract_c,
+                                    extract_a.flatten(1, -1),
+                                    extract_b.flatten(1, -1),
+                                )
+                            )
+                            .detach()
+                            .cpu()
+                            .contiguous()
+                        )
+                        del extract_c
+                else:
+                    module = module.to("cpu")
+                    weights = weights.to("cpu")
+                    continue
+
+                if decompose_mode == "low rank":
+                    loras[f"{lora_name}.lora_down.weight"] = (
+                        extract_a.detach().cpu().contiguous().half()
                     )
-                    del extract_c
-            else:
+                    loras[f"{lora_name}.lora_up.weight"] = (
+                        extract_b.detach().cpu().contiguous().half()
+                    )
+                    loras[f"{lora_name}.alpha"] = torch.Tensor([extract_a.shape[0]]).half()
+                    if use_bias:
+                        diff = diff.detach().cpu().reshape(extract_b.size(0), -1)
+                        sparse_diff = make_sparse(diff, sparsity).to_sparse().coalesce()
+
+                        indices = sparse_diff.indices().to(torch.int16)
+                        values = sparse_diff.values().half()
+                        loras[f"{lora_name}.bias_indices"] = indices
+                        loras[f"{lora_name}.bias_values"] = values
+                        loras[f"{lora_name}.bias_size"] = torch.tensor(diff.shape).to(
+                            torch.int16
+                        )
+                    del extract_a, extract_b, diff
+                elif decompose_mode == "full":
+                    if "Norm" in layer:
+                        w_key = "w_norm"
+                        b_key = "b_norm"
+                    else:
+                        w_key = "diff"
+                        b_key = "diff_b"
+                    weight_diff = module.weight - weights.weight
+                    loras[f"{lora_name}.{w_key}"] = (
+                        weight_diff.detach().cpu().contiguous().half()
+                    )
+                    if getattr(weights, "bias", None) is not None:
+                        bias_diff = module.bias - weights.bias
+                        loras[f"{lora_name}.{b_key}"] = (
+                            bias_diff.detach().cpu().contiguous().half()
+                        )
+                else:
+                    raise NotImplementedError
+            except Exception as e:
+                print(f"{layer} error: {e}", file=sys.stderr)
                 module = module.to("cpu")
                 weights = weights.to("cpu")
-                continue
+                break
 
-            if decompose_mode == "low rank":
-                loras[f"{lora_name}.lora_down.weight"] = (
-                    extract_a.detach().cpu().contiguous().half()
-                )
-                loras[f"{lora_name}.lora_up.weight"] = (
-                    extract_b.detach().cpu().contiguous().half()
-                )
-                loras[f"{lora_name}.alpha"] = torch.Tensor([extract_a.shape[0]]).half()
-                if use_bias:
-                    diff = diff.detach().cpu().reshape(extract_b.size(0), -1)
-                    sparse_diff = make_sparse(diff, sparsity).to_sparse().coalesce()
-
-                    indices = sparse_diff.indices().to(torch.int16)
-                    values = sparse_diff.values().half()
-                    loras[f"{lora_name}.bias_indices"] = indices
-                    loras[f"{lora_name}.bias_values"] = values
-                    loras[f"{lora_name}.bias_size"] = torch.tensor(diff.shape).to(
-                        torch.int16
-                    )
-                del extract_a, extract_b, diff
-            elif decompose_mode == "full":
-                if "Norm" in layer:
-                    w_key = "w_norm"
-                    b_key = "b_norm"
-                else:
-                    w_key = "diff"
-                    b_key = "diff_b"
-                weight_diff = module.weight - weights.weight
-                loras[f"{lora_name}.{w_key}"] = (
-                    weight_diff.detach().cpu().contiguous().half()
-                )
-                if getattr(weights, "bias", None) is not None:
-                    bias_diff = module.bias - weights.bias
-                    loras[f"{lora_name}.{b_key}"] = (
-                        bias_diff.detach().cpu().contiguous().half()
-                    )
-            else:
-                raise NotImplementedError
             module = module.to("cpu")
             weights = weights.to("cpu")
         return loras
@@ -299,12 +306,15 @@ def extract_diff(
             prefix = f"{LORA_PREFIX_TEXT_ENCODER}{idx+1}"
         else:
             prefix = LORA_PREFIX_TEXT_ENCODER
-        all_loras |= make_state_dict(
-            prefix,
-            te1,
-            te2,
-            TEXT_ENCODER_TARGET_REPLACE_MODULE,
-        )
+        try:
+            all_loras |= make_state_dict(
+                prefix,
+                te1,
+                te2,
+                TEXT_ENCODER_TARGET_REPLACE_MODULE,
+            )
+        except Exception as e:
+            print(f"{idx} Text Encoder Error: {e}", file=sys.stderr)
         del te1, te2
 
     all_loras |= make_state_dict(
